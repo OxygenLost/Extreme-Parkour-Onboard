@@ -61,7 +61,8 @@ Use ``--mode walk`` or ``--mode parkour`` to switch between **walking** and **pa
 python3 run_extreme_parkour.py --logdir traced --mode walk
 ```
 to perform a more conservative test. This command runs the policy without sending actions to the motors — useful for verifying perception and inference without physical movement.
-#### Performance 
+
+## Performance 
 The Go2 is capable of climbing over obstacles up to **40 cm** in height. Video will be provided soon.
 
 ## Acknowledgments
