@@ -6,14 +6,14 @@ This repository provides an **unofficial implementation** for deploying the proj
 
 - Add detailed comments throughout the training code. Documented the previously unexplained **observation** vector.
 
-- Add camera randomization during training to accout for Go2's movable camera (unlike A1's fixed camera).
+- ~~Add camera randomization during training to accout for Go2's movable camera (unlike A1's fixed camera).~~
 
-- Provide trained weights and deployment code for Unitree Go2.
+- Provide train weights and deployment code for Unitree Go2.
 
 ## Deployment Instructions
 
 #### Environment Setup
-Make sure the environment is properly set up on your Go2 robot, including rclpy, torch and unitree sdk. (If you need guidance for the environment setup, feel free to open an issue - I will provide detailed instructions.)
+Make sure the environment is properly set up on your Go2 robot, including rclpy, torch and unitree sdk.
 
 #### Hardware Setup
 Install the **Intel RealSense D435i** depth camera on the Go2. Verify that the captured images resemble the simulation (can be checked using `rviz`).
@@ -33,19 +33,14 @@ This script retrieves depth images from the D435i camera and publish them at 100
 
 3. In a second terminal, start the controller node:
 ```bash
-python3 run_extreme_parkour.py --logdir traced
+python3 run_extreme_parkour.py --logdir traced --mode parkour --nodryrun
 ```
-This script fuses the depth image and proprioception data. Now press the **L1 button** on the remote controller to execute the policy (the robot will process actions but will **not walk yet**).
-
-4. Prepare for movement:
-- Turn off the builtin sport service.
-- Place the robot in a free-hanging pose (e.g., in a small box or lifted by hand), allowing it to perform motions safely.
-
-5. Re-run the behavior policy node to allow walking:
-```bash
-python3 run_extreme_parkour.py --logdir traced --nodryrun
-```
-After pressing **L1**, the robot should now execute the walking strategy. To stop it, press **L2** or **R2**.
+This script fuses the depth image and proprioception data. Now the robot is in the sport mode:
+- Press **R1** to stand up.
+- Press **R2** to lie down.
+- Press **L1** to disable the builtin sport service and execute the stand policy.
+- After turning off the builtin sport service, press **Y** to start executing the parkour policy.
+- When finished, press **L2** to exit the parkour mode and re-enable native motion control.
 
 ## Notes and Tips
 
@@ -56,16 +51,18 @@ base_model = 'your_base_model.pth'
 vision_model = 'your_vision_model.pth'
 ```
 
-#### Parkour Mode:
-Adjust the one-hot encoding in `unitree_ros2_real.py` (line 472) to switch between **walking** and **parkour** mode:
+#### Walk Mode:
+It is recommended to test the walk mode to verify your model and camera setup:
 ```bash
-parkour_walk = torch.tensor([[1, 0]], device=self.model_device, dtype=torch.float32)
+python3 run_extreme_parkour.py --logdir traced --mode walk --nodryrun
 ```
-Since the original work trained separate policies for these two tasks.
-
-#### Performance disclaimer
-The provided weights achieve robust walking and minor obstacle negotiation. However, **parkour performance** is still noticeably below that shown in the original paper. Differences in depth camera behavior (fixed vs mobile, sim vs real) may be a major cause. 
-
+Use ``--mode walk`` or ``--mode parkour`` to switch between **walking** and **parkour** mode, as they were trained as separate tasks in the original work. You can aslo use
+```bash
+python3 run_extreme_parkour.py --logdir traced --mode walk
+```
+to perform a more conservative test. This command runs the policy without sending actions to the motors — useful for verifying perception and inference without physical movement.
+#### Performance 
+The Go2 is capable of climbing over obstacles up to **40 cm** in height. Video will be provided soon.
 
 ## Acknowledgments
 This repository is based on modification of [Robot Parkour Learning](https://github.com/ZiwenZhuang/parkour). Special thanks to the original authors for their open-source contribution.
