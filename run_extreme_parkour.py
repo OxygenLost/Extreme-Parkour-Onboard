@@ -3,15 +3,28 @@ from rclpy.node import Node
 from unitree_ros2_real import UnitreeRos2Real, get_euler_xyz
 
 import os
+import ast
 import os.path as osp
 import json
 import time
 from collections import OrderedDict
+from copy import deepcopy
 import numpy as np
 import torch
+import torch.nn.functional as F
+from torch.autograd import Variable
 from torch import nn
-from rsl_rl.modules import RecurrentDepthBackbone, DepthOnlyFCBackbone58x87
 
+from rsl_rl import modules
+from rsl_rl.modules import StateHistoryEncoder, RecurrentDepthBackbone, DepthOnlyFCBackbone58x87
+import cv2
+
+import sys
+import time
+import sys
+import threading
+
+from sport_api_constants import *
 
 class Go2Node(UnitreeRos2Real):
     def __init__(self, *args, **kwargs):
@@ -22,6 +35,10 @@ class Go2Node(UnitreeRos2Real):
         self.actions_sim = torch.from_numpy(np.load('Action_sim_335-11_flat.npy')).to(self.model_device)
 
         self.sim_ite = 3
+ 
+        self.use_stand_policy = False
+        self.use_parkour_policy = False
+        self.use_sport_mode = True
 
     # This warm up is useful in my experiment on Go2
     # The first two iterations are very slow, but the rest is fast
@@ -34,9 +51,8 @@ class Go2Node(UnitreeRos2Real):
             proprio_history = self._get_history_proprio() 
             get_hist_pro_time = time.monotonic()
 
-            if self.global_counter % self.visual_update_interval == 0:
-                depth_image = self._get_depth_image()
-                self.depth_latent_yaw = self.depth_encode(depth_image, proprio)
+            depth_image = self._get_depth_image()
+            self.depth_latent_yaw = self.depth_encode(depth_image, proprio)
 
             get_obs_time = time.monotonic()
 
@@ -71,10 +87,40 @@ class Go2Node(UnitreeRos2Real):
         )
         
     def main_loop(self):
-        if self.WirelessButtons.L1:
-            self.get_logger().info("L1 pressed")
-            self.start = True
-        if self.start:
+        if self.use_sport_mode:
+            if (self.joy_stick_buffer.keys & self.WirelessButtons.R1):
+                self.get_logger().info("In the sport mode, R1 pressed, robot will stand up.")
+                self._sport_mode_change(ROBOT_SPORT_API_ID_STANDUP)
+            if (self.joy_stick_buffer.keys & self.WirelessButtons.R2):
+                self.get_logger().info("In the sport mode, R2 pressed, robot will sit down.")
+                self._sport_mode_change(ROBOT_SPORT_API_ID_STANDDOWN)
+
+            if (self.joy_stick_buffer.keys & self.WirelessButtons.X):
+                self.get_logger().info("In the sport mode, X pressed, robot will balance stand.")
+                self._sport_mode_change(ROBOT_SPORT_API_ID_BALANCESTAND)
+
+            if (self.joy_stick_buffer.keys & self.WirelessButtons.L1):
+                self.get_logger().info("Exist the sport mode. Switch to stand policy.")
+                self.use_sport_mode = False
+                self._sport_state_change(0)
+                self.use_stand_policy = True
+                self.use_parkour_policy = False
+        
+        if self.use_stand_policy:
+            stand_action = self.get_stand_action()
+            self.send_stand_action(stand_action)
+        
+        if (self.joy_stick_buffer.keys & self.WirelessButtons.Y):
+            self.get_logger().info("Y pressed, use the parkour policy")
+            self.use_stand_policy = False
+            self.use_parkour_policy = True
+            self.use_sport_mode = False
+            self.global_counter = 0
+
+        if self.use_parkour_policy:
+            self.use_stand_policy = False
+            self.use_sport_mode = False
+            
             start_time = time.monotonic()
 
             proprio = self.get_proprio()
@@ -104,7 +150,7 @@ class Go2Node(UnitreeRos2Real):
 
             # action = self.actions_sim[self.sim_ite, :]
             self.send_action(action)
-            # print('action: ', action)
+            print('action: ', action)
             self.sim_ite += 1
 
             publish_time = time.monotonic()
@@ -120,6 +166,16 @@ class Go2Node(UnitreeRos2Real):
             )
 
             self.global_counter += 1
+
+        if (self.joy_stick_buffer.keys & self.WirelessButtons.L2):
+            self.get_logger().info("L2 pressed, stop using parkour policy, switch to sport mode.")
+            self.use_stand_policy = False
+            self.use_parkour_policy = False
+            self.use_sport_mode = True
+            self.reset_obs()
+            self._sport_state_change(1)
+            self._sport_mode_change(ROBOT_SPORT_API_ID_BALANCESTAND)
+
 
 @torch.inference_mode()
 def main(args):
@@ -140,6 +196,7 @@ def main(args):
         cfg= config_dict,
         model_device= device,
         dryrun= not args.nodryrun,
+        mode = args.mode,
     )
 
     env_node.get_logger().info("Model loaded from: {}".format(osp.join(args.logdir)))
@@ -147,14 +204,11 @@ def main(args):
     env_node.get_logger().info("Motor Stiffness (kp): {}".format(env_node.p_gains))
     env_node.get_logger().info("Motor Damping (kd): {}".format(env_node.d_gains))
 
+    base_model_name = 'base_jit.pt'
+    base_model_path = os.path.join(args.logdir, base_model_name)
 
-    # base_model = '329-12-38-19500-base_jit.pt'
-    base_model = '336-11-29500-base_jit.pt'
-    base_model_path = os.path.join(args.logdir, base_model)
-
-    # vision_model_name = '329-12-38-19500-vision_weight.pt'
-    vision_model = '336-11-29500-vision_weight.pt'
-    vision_model_path = os.path.join(args.logdir, vision_model)
+    vision_model_name = 'vision_weight.pt'
+    vision_model_path = os.path.join(args.logdir, vision_model_name)
 
     base_model = torch.jit.load(base_model_path, map_location=device)
     base_model.eval()
@@ -173,15 +227,16 @@ def main(args):
     def turn_obs(proprio, depth_latent_yaw, proprio_history, n_proprio, n_depth_latent, n_hist_len):
         depth_latent = depth_latent_yaw[:, :-2]
         yaw = depth_latent_yaw[:, -2:] * 1.5
-        # yaw = depth_latent_yaw[:, -2:] * 0
         print('yaw: ', yaw)
+        
+        proprio[:, 6:8] = yaw
 
         lin_vel_latent = estimator(proprio)
 
         activation = nn.ELU()
         priv_latent = hist_encoder(activation, proprio_history.view(-1, n_hist_len, n_proprio))
 
-        proprio[:, 6:8] = yaw
+        
         obs = torch.cat([proprio, depth_latent, lin_vel_latent, priv_latent], dim=-1)
 
         return obs
@@ -201,6 +256,7 @@ def main(args):
 
     env_node.start_ros_handlers()
     env_node.warm_up()
+
     if args.loop_mode == "while":
         rclpy.spin_once(env_node, timeout_sec= 0.)
         env_node.get_logger().info("Model and Policy are ready")
@@ -227,6 +283,7 @@ if __name__ == "__main__":
         choices= ["while", "timer"],
         help= "Select which mode to run the main policy control iteration",
     )
-
+    parser.add_argument("--mode", type= str, default= "parkour", choices=["parkour", "walk"])
     args = parser.parse_args()
+    
     main(args)

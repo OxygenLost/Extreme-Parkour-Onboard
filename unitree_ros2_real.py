@@ -5,9 +5,13 @@ from rclpy.node import Node
 from unitree_go.msg import (
     WirelessController,
     LowState,
+    SportModeState,
     LowCmd,
 )
+from unitree_api.msg import Request, RequestHeader
+
 from std_msgs.msg import Float32MultiArray
+
 if os.uname().machine in ["x86_64", "amd64"]:
     sys.path.append(os.path.join(
         os.path.dirname(os.path.abspath(__file__)),
@@ -20,6 +24,8 @@ elif os.uname().machine == "aarch64":
     ))
 from crc_module import get_crc
 
+from multiprocessing import Process
+from collections import OrderedDict
 import numpy as np
 import torch
 import time
@@ -93,7 +99,7 @@ class RobotCfgs:
             -1.0472, -0.5236, -2.7227,
             -1.0472, -0.5236, -2.7227,
         ], device= "cpu", dtype= torch.float32)
-        torque_limits = torch.tensor([ # from urdf
+        torque_limits = torch.tensor([ # from urdf and in simulation order
             25, 40, 40,
             25, 40, 40,
             25, 40, 40,
@@ -142,6 +148,7 @@ class UnitreeRos2Real(Node):
             dof_pos_protect_ratio= 1.1, # if the dof_pos is out of the range of this ratio, the process will shutdown.
             robot_class_name= "Go2",
             dryrun= True, # if True, the robot will not send commands to the real robot
+            mode= "parkour",
         ):
         super().__init__("unitree_ros2_real")
         self.NUM_DOF = getattr(RobotCfgs, robot_class_name).NUM_DOF
@@ -165,25 +172,61 @@ class UnitreeRos2Real(Node):
         self.dof_pos_protect_ratio = dof_pos_protect_ratio
         self.robot_class_name = robot_class_name
         self.dryrun = dryrun
+        self.mode = mode
 
         self.dof_map = getattr(RobotCfgs, robot_class_name).dof_map
         self.dof_names = getattr(RobotCfgs, robot_class_name).dof_names
         self.dof_signs = getattr(RobotCfgs, robot_class_name).dof_signs
         self.turn_on_motor_mode = getattr(RobotCfgs, robot_class_name).turn_on_motor_mode
 
-        # self.n_obs = 
         self.n_proprio = 53
         self.n_depth_latent = 32
         self.n_hist_len = 10
 
         self.proprio_history_buf = torch.zeros(1, self.n_hist_len, self.n_proprio, device=self.model_device, dtype=torch.float)
         self.episode_length_buf = torch.zeros(1, device=self.model_device, dtype=torch.float)
+        self.forward_depth_latent_yaw_buffer = torch.zeros(1, self.n_depth_latent+2, device=self.model_device, dtype=torch.float)
         self.xyyaw_command = torch.tensor([[0, 0, 0]], device= self.model_device, dtype= torch.float32)
-        self.contact_filt = torch.zeros((1, 4), device= self.model_device, dtype= torch.float32)
-        # self.last_contact_filt = torch.zeros((1, 4), device= self.model_device, dtype= torch.float32)
+        self.contact_filt = torch.ones((1, 4), device= self.model_device, dtype= torch.float32)
+        self.last_contact_filt = torch.ones((1, 4), device= self.model_device, dtype= torch.float32)
 
         self.parse_config()
-        
+        self.init_stand_config()
+
+    def init_stand_config(self):
+        self.startPos = [0.0] * 12
+        self._targetPos_1 = [0.0, 1.36, -2.65, 0.0, 1.36, -2.65,
+                             -0.2, 1.36, -2.65, 0.2, 1.36, -2.65]
+        self._targetPos_2 = [0.0, 0.67, -1.3, 0.0, 0.67, -1.3,
+                             0.0, 0.67, -1.3, 0.0, 0.67, -1.3]
+        self.stand_action = [0.0] * 12
+
+        self.duration_1 = 10
+        self.duration_2 = 100
+        self.percent_1 = 0
+        self.percent_2 = 0
+
+        self.firstrun_target_1 = True
+        self.firstRun = True
+
+    def reset_obs(self):
+        self.startPos = [0.0] * 12
+        self.stand_action = [0.0] * 12
+
+        self.percent_1 = 0
+        self.percent_2 = 0
+
+        self.firstrun_target_1 = True
+        self.firstRun = True
+
+        self.actions = torch.zeros(self.NUM_ACTIONS, device= self.model_device, dtype= torch.float32)    
+        self.proprio_history_buf = torch.zeros(1, self.n_hist_len, self.n_proprio, device=self.model_device, dtype=torch.float)
+        self.episode_length_buf = torch.zeros(1, device=self.model_device, dtype=torch.float)
+        self.forward_depth_latent_yaw_buffer = torch.zeros(1, self.n_depth_latent+2, device=self.model_device, dtype=torch.float)
+        self.xyyaw_command = torch.tensor([[0, 0, 0]], device= self.model_device, dtype= torch.float32)
+        self.contact_filt = torch.ones((1, 4), device= self.model_device, dtype= torch.float32)
+        self.last_contact_filt = torch.ones((1, 4), device= self.model_device, dtype= torch.float32)
+
 
     def parse_config(self):
         """ parse, set attributes from config dict, initialize buffers to speed up the computation """
@@ -251,7 +294,6 @@ class UnitreeRos2Real(Node):
     def start_ros_handlers(self):
         """ after initializing the env and policy, register ros related callbacks and topics
         """
-
         # ROS publishers
         self.low_cmd_pub = self.create_publisher(
             LowCmd,
@@ -277,6 +319,18 @@ class UnitreeRos2Real(Node):
         )
         self.get_logger().info("Wireless controller subscriber started, waiting to receive wireless controller messages.")
 
+        self.sport_state_pub = self.create_publisher(
+            Request,
+            '/api/robot_state/request',
+            1,
+        )
+
+        self.sport_mode_pub = self.create_publisher(
+            Request,
+            '/api/sport/request',
+            1,
+        )
+
         self.depth_input_sub = self.create_subscription(
             Float32MultiArray,
             self.depth_data_topic,
@@ -298,7 +352,7 @@ class UnitreeRos2Real(Node):
     """ ROS callbacks and handlers that update the buffer """
 
     def _low_state_callback(self, msg):
-        # self.get_logger().info("Low state message received.")
+        # self.get_logger().warn("Low state message received.")
         """ store and handle proprioception data """
         self.low_state_buffer = msg # keep the latest low state
 
@@ -309,18 +363,9 @@ class UnitreeRos2Real(Node):
         for sim_idx in range(self.NUM_DOF):
             real_idx = self.dof_map[sim_idx]
             self.dof_vel_[0, sim_idx] = self.low_state_buffer.motor_state[real_idx].dq * self.dof_signs[sim_idx]
-        # automatic safety check
-        for sim_idx in range(self.NUM_DOF):
-            real_idx = self.dof_map[sim_idx]
-            if self.dof_pos_[0, sim_idx] > self.joint_pos_protect_high[sim_idx] or \
-                self.dof_pos_[0, sim_idx] < self.joint_pos_protect_low[sim_idx]:
-                self.get_logger().error(f"Joint {sim_idx}(sim), {real_idx}(real) position out of range at {self.low_state_buffer.motor_state[real_idx].q}")
-                self.get_logger().error("The motors and this process shuts down.")
-                self._turn_off_motors()
-                raise SystemExit()
 
     def _joy_stick_callback(self, msg):
-        # self.get_logger().info("Wireless controller message received.")
+        # self.get_logger().warn("Wireless controller message received.")
         self.joy_stick_buffer = msg
         if self.move_by_wireless_remote:
             # left-y for forward/backward
@@ -359,12 +404,14 @@ class UnitreeRos2Real(Node):
         # 00000000 00000001 means pressing the 0-th button (R1)
         # 00000000 00000010 means pressing the 1-th button (L1)
         # 10000000 00000000 means pressing the 15-th button (left)
-        if (msg.keys & self.WirelessButtons.R2) or (msg.keys & self.WirelessButtons.L2): # R2 or L2 is pressed
-            self.get_logger().warn("R2 or L2 is pressed, the motors and this process shuts down.")
-            self._turn_off_motors()
-            raise SystemExit()
+        
+        # if (msg.keys & self.WirelessButtons.R2) or (msg.keys & self.WirelessButtons.L2): # R2 or L2 is pressed
+        # if  msg.keys & self.WirelessButtons.L2: # R2 or L2 is pressed
+        #     self.get_logger().warn("R2 or L2 is pressed, the motors and this process shuts down.")
+        #     self._turn_off_motors()
+        #     raise SystemExit()
 
-        # roll-pitch target, not implemented yet
+        # roll-pitch target
         if hasattr(self, "roll_pitch_yaw_cmd"):
             if (msg.keys & self.WirelessButtons.up):
                 self.roll_pitch_yaw_cmd[0, 1] += 0.1
@@ -381,6 +428,41 @@ class UnitreeRos2Real(Node):
 
     def _depth_data_callback(self, msg):
         self.depth_data = torch.tensor(msg.data, dtype=torch.float32).reshape(1, 58, 87).to(self.model_device)
+
+    
+    def _sport_mode_change(self, mode):
+        msg = Request()
+
+        msg.header.identity.id = 0
+        msg.header.identity.api_id = mode
+        msg.header.lease.id = 0
+        msg.header.policy.priority = 0
+        msg.header.policy.noreply = False
+
+        msg.parameter = ''
+        msg.binary = []
+
+        self.sport_mode_pub.publish(msg)
+    
+    def _sport_state_change(self, mode):
+        msg = Request()
+
+        # Fill the header
+        msg.header.identity.id = 0
+        msg.header.identity.api_id = 1001
+        msg.header.lease.id = 0
+        msg.header.policy.priority = 0
+        msg.header.policy.noreply = False
+
+        if mode == 0:
+            msg.parameter = '{"name":"sport_mode","switch":0}'
+        elif mode == 1:
+            msg.parameter = '{"name":"sport_mode","switch":1}'
+        
+        msg.binary = []
+
+        # Publish the request
+        self.sport_state_pub.publish(msg)
 
     """ Done: ROS callbacks and handlers that update the buffer """
 
@@ -432,13 +514,6 @@ class UnitreeRos2Real(Node):
             else:
                 self.contact_filt[:, i] = 0.5
         return self.contact_filt
-        # self.contact = torch.tensor(self.low_state_buffer.foot_force, dtype=torch.float32).unsqueeze(0).to(device=self.model_device) >  25.
-        # print('contact: ', self.contact)
-        # self.contact_filt = torch.logical_or(self.contact, self.last_contact_filt).float()
-        # print('contact filt: ', self.contact_filt)
-        # print('last contact filt: ', self.last_contact_filt)
-        # self.last_contact_filt = self.contact
-        # return self.contact_filt - 0.5
 
     def _get_depth_image(self):
         return self.depth_data
@@ -465,8 +540,10 @@ class UnitreeRos2Real(Node):
         commands = self._get_commands_obs()  # (1, 3)
         commands_time = time.monotonic()
 
-        # parkour_walk = torch.tensor([[1, 0]], device= self.model_device, dtype= torch.float32) # parkour
-        parkour_walk = torch.tensor([[0, 1]], device= self.model_device, dtype= torch.float32) # walk
+        if self.mode == "parkour":
+            parkour_walk = torch.tensor([[1, 0]], device= self.model_device, dtype= torch.float32) # parkour
+        elif self.mode == "walk":
+            parkour_walk = torch.tensor([[0, 1]], device= self.model_device, dtype= torch.float32) # walk
 
         dof_pos = self._get_dof_pos_obs()  # (1, 12)
         dof_pos_time = time.monotonic()
@@ -510,44 +587,60 @@ class UnitreeRos2Real(Node):
         return proprio
 
 
-
-    """ Done: refresh observation buffer and corresponding sub-functions """
-
-    """ Control related functions """
-    def clip_action_before_scale(self, action):
-        action = torch.clip(action, -self.clip_actions, self.clip_actions)
-        return action
-
-    def clip_by_torque_limit(self, actions_scaled):
-        control_type = self.cfg["control"]["control_type"]
-        if control_type == "P":
-            p_limits_low = (-self.torque_limits) + self.d_gains*self.dof_vel_
-            p_limits_high = (self.torque_limits) + self.d_gains*self.dof_vel_
-            actions_low = (p_limits_low/self.p_gains) - self.default_dof_pos + self.dof_pos_
-            actions_high = (p_limits_high/self.p_gains) - self.default_dof_pos + self.dof_pos_
-            print('action low and high: ', actions_low, actions_high)
-        else:
-            raise NotImplementedError
-
-        return torch.clip(actions_scaled, actions_low, actions_high)
-
     def send_action(self, actions):
         """ Send the action to the robot motors, which does the preprocessing
         just like env.step in simulation.
         Thus, the actions has the batch dimension, whose size is 1.
         """
+        if isinstance(actions, list):
+            actions = torch.tensor(actions, device=self.model_device).unsqueeze(0)
+        
         self.actions = actions
 
         hard_clip = self.cfg["normalization"]["clip_actions"]/self.cfg["control"]["action_scale"]
         clipped_scaled_action = torch.clip(actions, -hard_clip, hard_clip) * self.cfg["control"]["action_scale"]
         
         robot_coordinates_action = clipped_scaled_action + self.default_dof_pos.unsqueeze(0)
-        # print('coordinates action: ', robot_coordinates_action)
-        self._publish_legs_cmd(robot_coordinates_action[0])
+        self._publish_legs_cmd(robot_coordinates_action[0], stand=False)
 
+    def send_stand_action(self, actions):
+        """ Send the action to the robot motors, which does the preprocessing
+        just like env.step in simulation.
+        Thus, the actions has the batch dimension, whose size is 1.
+        """
+        actions = torch.tensor(actions, device=self.model_device).unsqueeze(0)
+        self.actions = actions
+
+        self._publish_legs_cmd(actions[0], stand=True)
+
+    def get_stand_action(self):
+        if self.firstRun:
+            for i in range(12):
+                self.startPos[i] = self.low_state_buffer.motor_state[i].q
+            self.firstRun = False
+
+        self.percent_1 += 1.0 / self.duration_1
+        self.percent_1 = min(self.percent_1, 1)
+        if self.percent_1 < 1:
+            for i in range(12):
+                self.stand_action[i] = (1 - self.percent_1) * self.startPos[i] + self.percent_1 * self._targetPos_1[i]
+
+            if self.firstrun_target_1:
+                self.get_logger().info('Going to target Pos 1.', once=True)
+                self.firstrun_target_1 = False
+                self.firstrun_target_2 = True
+        if (self.percent_1 == 1) and (self.percent_2 <= 1):
+            self.percent_2 += 1.0 / self.duration_2
+            self.percent_2 = min(self.percent_2, 1)
+            for i in range(12):
+                self.stand_action[i] = (1 - self.percent_2) * self._targetPos_1[i] + self.percent_2 * self._targetPos_2[i]
+
+            self.get_logger().info('Staying in target Pos 2.', once=True)
+
+        return self.stand_action
 
     """ functions that actually publish the commands and take effect """
-    def _publish_legs_cmd(self, robot_coordinates_action: torch.Tensor):
+    def _publish_legs_cmd(self, robot_coordinates_action, stand):
         """ Publish the joint commands to the robot legs in robot coordinates system.
         robot_coordinates_action: shape (NUM_DOF,), in simulation order.
         """
